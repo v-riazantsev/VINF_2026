@@ -23,7 +23,7 @@ HEADERS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
 ]
-TIMEOUT = 10 # seconds
+TIMEOUT = 15 # seconds
 
 input_lock = threading.Lock()
 output_lock = threading.Lock()
@@ -78,11 +78,36 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
                 last_request_time = time.time()
 
         except (requests.exceptions.RequestException) as e:
-            #print(f"[!] Request failed for {url} via {proxy_url}: {e}")
+            should_remove_proxy = False
+
+            # 1. Check for SSL Errors
+            if isinstance(e, requests.exceptions.SSLError):
+                should_remove_proxy = True
+
+            # 2. Check for Connection Reset (Errno 104) or Remote Disconnections
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                error_msg = str(e)
+                if "104" in error_msg or "Connection reset by peer" in error_msg or "Remote end closed connection" in error_msg:
+                    should_remove_proxy = True
+
+            # 3. Handle proxy removal
+            if should_remove_proxy:
+                with proxy_lock:
+                    if proxy_url in active_proxies:
+                        active_proxies.remove(proxy_url)
+                        print(f"[-] Removed dead proxy: {proxy_url}")
+
+            # Ignore known transient errors
+            if not isinstance(e, ( 
+                requests.exceptions.ProxyError, 
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout
+            )):
+                print(f"[!] Request failed for {url} via {proxy_url}: {e}")
 
             with input_lock:
                 awaiting_urls.append(url)
-            return  # Exit function cleanly for this worker thread
+            return
             
 
         match response.status_code:
@@ -91,7 +116,7 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
                 if response.status_code == 200: # Save the response text to a file in the output directory
                     with open(f"{os.path.join(output_dir, url.split('/')[-1])}.txt", 'w') as f:
                         f.write(response.text)
-                print(f"[+] Successfully scraped {url} via {proxy_url}")
+                print(f"[+] Scraped {url} via {proxy_url}")
             case 403: # Assume the proxy is blocked, remove it from the active proxies list and return url to the awaiting_urls list
                 with proxy_lock:
                     if proxy_url in active_proxies:
@@ -192,10 +217,11 @@ def main():
     if not os.path.exists(args.urls_done):
         open(args.urls_done, 'w').close()
 
-
     # Create a list of URLs to scrape, excluding those that have already been scraped or failed
     done_urls = read_lines(args.urls_done)
     awaiting_urls = list(set(read_lines(args.urls_path)) - set(done_urls))
+
+    print(f"Total URLs to scrape: {len(awaiting_urls)}")
 
 
     # Start the proxy refresh loop in a separate thread
