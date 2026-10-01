@@ -87,7 +87,13 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
             # 2. Check for Connection Reset (Errno 104) or Remote Disconnections
             elif isinstance(e, requests.exceptions.ConnectionError):
                 error_msg = str(e)
-                if "104" in error_msg or "Connection reset by peer" in error_msg or "Remote end closed connection" in error_msg:
+                if (
+                    "104" in error_msg 
+                    or "Connection reset by peer" in error_msg 
+                    or "Remote end closed connection" in error_msg
+                    or "IncompleteRead" in error_msg
+                    or "Connection broken" in error_msg
+                ):
                     should_remove_proxy = True
 
             # 3. Handle proxy removal
@@ -96,9 +102,7 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
                     if proxy_url in active_proxies:
                         active_proxies.remove(proxy_url)
                         print(f"[-] Removed dead proxy: {proxy_url}")
-
-            # Ignore known transient errors
-            if not isinstance(e, ( 
+            elif not isinstance(e, ( # Ignore known transient errors
                 requests.exceptions.ProxyError, 
                 requests.exceptions.ConnectTimeout,
                 requests.exceptions.ReadTimeout
