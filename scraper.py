@@ -5,8 +5,8 @@ import time
 import os
 import requests
 
-SPAWN_INTERVAL = 0.1
-REQUEST_INTERVAL = 0.25
+SPAWN_INTERVAL = 0.1 # seconds
+REQUEST_INTERVAL = 0.3 # seconds
 
 PROXY_API_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=http&anonymity=elite%2Canonymous&ssl=yes"
 PROXY_REFRESH_INTERVAL = 60 # seconds
@@ -23,7 +23,7 @@ HEADERS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
 ]
-TIMEOUT = 15
+TIMEOUT = 10 # seconds
 
 input_lock = threading.Lock()
 output_lock = threading.Lock()
@@ -78,12 +78,8 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
                 last_request_time = time.time()
 
         except (requests.exceptions.RequestException) as e:
-            print(f"[!] Request failed for {url} via {proxy_url}: {e}")
+            #print(f"[!] Request failed for {url} via {proxy_url}: {e}")
 
-            if proxy_url:
-                with proxy_lock:
-                    if proxy_url in active_proxies:
-                        active_proxies.remove(proxy_url)
             with input_lock:
                 awaiting_urls.append(url)
             return  # Exit function cleanly for this worker thread
@@ -164,12 +160,15 @@ def proxy_refresh_loop(refresh_interval):
                 active_proxies = new_proxies
             print(f"[+] Refreshed proxies. Total active proxies: {len(active_proxies)}")
         except Exception as e:
-            print(f"[!] Failed to refresh proxies: {e}")
+            print(f"[!] Failed to refresh proxies: {e}\n retrying in 5 seconds...")
+            time.sleep(5)
+            continue
+
         time.sleep(refresh_interval)
 
 
 def get_proxies():
-    response = requests.get(PROXY_API_URL)
+    response = requests.get(PROXY_API_URL, timeout=TIMEOUT)
     response.raise_for_status()
     proxy_list = response.text.strip().split()
     return proxy_list
