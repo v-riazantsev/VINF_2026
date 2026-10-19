@@ -36,6 +36,7 @@ NODRIVER_BROWSER_PATH = "/usr/bin/chromium"
 IGNORE_URLS_MASK = [
     "https://keeptrack.space/launch/*",
     "https://keeptrack.space/tag/*",
+    "https://keeptrack.space/app/*"
 ]
 
 state_lock = threading.Lock()
@@ -212,7 +213,7 @@ async def scrape_with_nodriver(url):
             raise TimeoutError(f"Nodriver timeout or failed to resolve challenge for {url}")
 
         # Extra buffer for slow DOM/table data initialization
-        await asyncio.sleep(10)
+        await asyncio.sleep(6)
         html_content = await page.get_content()
         return html_content
     finally:
@@ -381,6 +382,7 @@ def nodriver_loop():
         with processing_urls_lock, captcha_list_lock:
             available_urls = captcha_urls - processing_urls
             if available_urls:
+                print(f"[*] Remaining URLs in captcha list: {len(captcha_urls)}")
                 url = available_urls.pop()
                 processing_urls.add(url)
             else:

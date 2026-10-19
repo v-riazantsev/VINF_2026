@@ -9,7 +9,7 @@ def extract_hostname(url):
 
 def extract_links(html_content, current_url):
     # Changed .*# to ^# so it only blocks links starting with a hash, not URLs with fragments at the end
-    pattern = r"\bhref=[\"'](?!#|[^\"']*\.(?:png|svg|jpg|jpeg|gif|webp|css|xml|ico)[\'\"])([^\"']+)[\"']"
+    pattern = r"\bhref=[\"'](?!#|[^\"']*\.(?:png|svg|jpg|jpeg|gif|webp|css|xml|ico|html)[\'\"])([^\"']+)[\"']"
     
     current_host = extract_hostname(current_url)
     
