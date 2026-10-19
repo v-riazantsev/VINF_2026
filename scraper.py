@@ -9,9 +9,10 @@ import tempfile
 import shutil
 import nodriver as uc
 
+import link_extractor
+
 SPAWN_INTERVAL = 0.1 # seconds
 REQUEST_INTERVAL = 0.3 # seconds
-NODRIVER_REQUEST_INTERVAL = 5.0 # seconds - separate request interval for nodriver
 
 PROXY_API_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=http&anonymity=elite%2Canonymous&ssl=yes"
 PROXY_REFRESH_INTERVAL = 60 # seconds
@@ -31,20 +32,26 @@ HEADERS = [
 TIMEOUT = 15 # seconds
 
 NODRIVER_BROWSER_PATH = "/usr/bin/chromium"
-CAPTCHA_URL_MASK = [
-    "https://keeptrack.space/satellites/constellations/*",
+
+IGNORE_URLS_MASK = [
+    "https://keeptrack.space/launch/*",
+    "https://keeptrack.space/tag/*",
 ]
 
-input_lock = threading.Lock()
-output_lock = threading.Lock()
 state_lock = threading.Lock()
 proxy_lock = threading.Lock()
 rate_lock = threading.Lock()
 nodriver_lock = threading.Lock() # Lock to ensure only one nodriver instance runs at a time
-nodriver_rate_lock = threading.Lock()
+captcha_list_lock = threading.Lock()
+done_urls_lock = threading.Lock()
+awaiting_urls_lock = threading.Lock()
+processing_urls_lock = threading.Lock()
 
 active_threads = 0
-awaiting_urls = []
+awaiting_urls = set() # Set of URLs that are waiting to be scraped
+processing_urls = set() # Set of URLs that are currently being processed
+captcha_urls = set() # List of URLs identified as protected by Cloudflare/captcha
+done_urls = set() # Set of URLs that have already been scraped successfully
 active_proxies = []
 last_request_time = 0.0
 last_nodriver_request_time = 0.0
@@ -55,10 +62,76 @@ def read_lines(file_path):
         lines = [line for line in f.read().splitlines() if line.strip()]
     return lines
 
-def append_line(lock: threading.Lock, file_path, line):
-    with lock:
-        with open(file_path, 'a', buffering=1) as f:
-            f.write(line + '\n')
+def append_line(file_path, line):
+    with open(file_path, 'a', buffering=1) as f:
+        f.write(line + '\n')
+
+def mark_url_as_done(urls_done_file, url):
+    with done_urls_lock:
+        done_urls.add(url)
+        append_line(urls_done_file, url)
+    with processing_urls_lock:
+        processing_urls.discard(url)
+
+def add_url_to_awaiting(urls_awaiting_file, url):
+    with awaiting_urls_lock:
+        awaiting_urls.add(url)
+        append_line(urls_awaiting_file, url)
+    
+def process_scraped_content(html_content, current_url, output_dir, urls_awaiting_file):
+    save_scraped_content(output_dir, current_url, html_content)
+
+    links = link_extractor.extract_links(html_content, current_url)
+    for link in links:
+        if not is_url_ignored(link) and link not in done_urls and link not in awaiting_urls and link not in processing_urls:
+            add_url_to_awaiting(urls_awaiting_file, link)
+            print(f"[+] Found new link: {link} (from {current_url})")
+
+def save_scraped_content(output_dir, url, content):
+    # Remove protocol (e.g. https://)
+    path_part = url.split("://")[-1]
+    
+    # Replace characters that are unsafe for filenames/paths while preserving structure
+    # Convert query parameters (? -> _q_) and fragments (# -> _h_) to keep separate files distinct
+    clean_path = path_part.replace('?', '_q_').replace('=', '_').replace('&', '_').replace('#', '_h_')
+    
+    # Split into directory components and filename
+    parts = [p for p in clean_path.split('/') if p]
+    
+    if not parts:
+        parts = ["index"]
+        
+    domain_and_dirs = parts[:-1]
+    filename = parts[-1]
+    
+    if not filename.endswith('.html'):
+        filename += '.html'
+        
+    # Construct target directory path and ensure it exists
+    target_dir = os.path.join(output_dir, *domain_and_dirs)
+    os.makedirs(target_dir, exist_ok=True)
+    
+    output_path = os.path.join(target_dir, filename)
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+def is_captcha_protected_content(content):
+    return (
+        "Ray ID:" in content 
+        or "Verify you are human" in content 
+        or "Just a moment..." in content
+        or "cf-challenge" in content
+    )
+
+def is_url_ignored(url):
+    for mask in IGNORE_URLS_MASK:
+        if mask.endswith('*'):
+            if url.startswith(mask[:-1]):
+                return True
+        elif url == mask:
+            return True
+    return False
 
 async def scrape_with_nodriver(url):
     # Create a completely fresh, temporary profile directory
@@ -81,7 +154,7 @@ async def scrape_with_nodriver(url):
         is_loaded = False
         is_solved = False
         
-        for second in range(60):
+        for second in range(30):
             await asyncio.sleep(1)
             try:
                 # Check readyState first to confirm the page has actually finished initial loading
@@ -101,11 +174,8 @@ async def scrape_with_nodriver(url):
             except Exception:
                 continue
             
-            # Check if Cloudflare challenge indicators are present
-            has_challenge = "Ray ID:" in content or "Verify you are human" in content or "Just a moment..." in content
-            
             # Once loaded and challenge is cleared, we have success
-            if not has_challenge and len(content) > 800:
+            if not is_captcha_protected_content(content) and len(content) > 800:
                 print(f"[+] Cloudflare verification cleared successfully after {second} seconds!")
                 is_solved = True
                 break
@@ -129,48 +199,34 @@ async def scrape_with_nodriver(url):
         # Clean up temporary profile directory
         shutil.rmtree(user_data_dir, ignore_errors=True)
 
-def scrape_url(url, proxy_url, output_dir, urls_done_file):
+def scrape_url_nodriver_task(url, output_dir, awaiting_urls_file, urls_done_file):
+    global last_nodriver_request_time
+    print(f"[*] Requesting nodriver execution for {url}...")
+    
+    # Ensure only one nodriver instance runs at a time
+    with nodriver_lock:
+        try:
+            html_content = asyncio.run(scrape_with_nodriver(url))
+
+            process_scraped_content(html_content, url, output_dir, awaiting_urls_file)
+            mark_url_as_done(urls_done_file, url)
+
+            print(f"[+] Scraped (nodriver) {url}")
+        except Exception as e:
+            print(f"[!] Nodriver failed / timed out for {url}: {e}")
+            # Return URL back to captcha list for future retry
+            with captcha_list_lock:
+                captcha_urls.add(url)
+        finally:
+            with state_lock:
+                global active_threads
+                active_threads -= 1
+
+def scrape_url(url, proxy_url, output_dir, awaiting_urls_file, urls_done_file):
     try:
-        global last_request_time, last_nodriver_request_time
+        global last_request_time
         
-        # Check if URL matches any pattern in CAPTCHA_URL_MASK
-        is_captcha_target = any(url.startswith(pattern.rstrip('*')) for pattern in CAPTCHA_URL_MASK)
-        
-        if is_captcha_target:
-            print(f"[*] URL {url} matches CAPTCHA mask. Requesting nodriver execution...")
-            
-            # Ensure only one nodriver instance runs at a time
-            with nodriver_lock:
-                # Enforce nodriver specific rate limiting
-                with nodriver_rate_lock:
-                    now = time.time()
-                    elapsed = now - last_nodriver_request_time
-                    if elapsed < NODRIVER_REQUEST_INTERVAL:
-                        time.sleep(NODRIVER_REQUEST_INTERVAL - elapsed)
-
-                try:
-                    html_content = asyncio.run(scrape_with_nodriver(url))
-                    
-                    with nodriver_rate_lock:
-                        last_nodriver_request_time = time.time()
-
-                    append_line(output_lock, urls_done_file, url)
-                    file_name = url.split('/')[-1]
-                    if not file_name or file_name.startswith('#'):
-                        file_name = "index"
-                    output_path = os.path.join(output_dir, f"{file_name}.txt")
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(html_content)
-                    print(f"[+] Scraped (nodriver) {url}")
-                    return
-                except Exception as e:
-                    print(f"[!] Nodriver failed / timed out for {url}: {e}")
-                    # Return URL back to awaiting list without marking as done
-                    with input_lock:
-                        awaiting_urls.append(url)
-                    return
-
-        # Standard requests scraping logic below
+        # Standard requests scraping logic
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
         # Set up the headers for the request
@@ -229,24 +285,32 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
             )):
                 print(f"[!] Request failed for {url} via {proxy_url}: {e}")
 
-            with input_lock:
-                awaiting_urls.append(url)
+            add_url_to_awaiting(awaiting_urls_file, url)
             return
 
         match response.status_code:
             case 200 | 404: # Success
-                append_line(output_lock, urls_done_file, url)
-                if response.status_code == 200: # Save the response text to a file in the output directory
-                    with open(f"{os.path.join(output_dir, url.split('/')[-1])}.txt", 'w') as f:
-                        f.write(response.text)
-                print(f"[+] Scraped {url} via {proxy_url}")
-            case 403: # Assume the proxy is blocked, remove it from the active proxies list and return url to the awaiting_urls list
-                with proxy_lock:
-                    if proxy_url in active_proxies:
-                        active_proxies.remove(proxy_url)
-                with input_lock:
-                    awaiting_urls.append(url)
-                print(f"[!] Proxy {proxy_url} blocked for {url}, removed from active proxies.")
+                # Check if content is protected by Cloudflare / captcha challenge
+                if is_captcha_protected_content(response.text):
+                    print(f"[!] Page {url} is protected by Cloudflare/CAPTCHA. Adding to captcha list.")
+                    with captcha_list_lock:
+                        captcha_urls.add(url)
+                else:
+                    if response.status_code == 200: # Save the response text to a file in the output directory
+                        process_scraped_content(response.text, url, output_dir, awaiting_urls_file)
+                    mark_url_as_done(urls_done_file, url)
+                    print(f"[+] Scraped {url} via {proxy_url}")
+            case 403: # Check if 403 is due to Cloudflare challenge before assuming proxy block
+                if is_captcha_protected_content(response.text):
+                    print(f"[!] Page {url} returned 403 due to Cloudflare/CAPTCHA. Adding to captcha list.")
+                    with captcha_list_lock:
+                        captcha_urls.add(url)
+                else:
+                    with proxy_lock:
+                        if proxy_url in active_proxies:
+                            active_proxies.remove(proxy_url)
+                    add_url_to_awaiting(awaiting_urls_file, url)
+                    print(f"[!] Proxy {proxy_url} blocked for {url}, removed from active proxies.")
             case _: # Unknown error, print error and stop the program
                 print(f"Error: {response.status_code} for URL: {url} with proxy: {proxy_url}\n{response.text}")
                 with open("error_log.txt", 'a') as f:
@@ -257,11 +321,8 @@ def scrape_url(url, proxy_url, output_dir, urls_done_file):
             global active_threads
             active_threads -= 1
 
-def spawn_loop(urls_done_file, output_dir, max_threads, spawn_interval):
-    global active_threads, awaiting_urls, active_proxies
-
-    with input_lock:
-        random.shuffle(awaiting_urls)
+def spawn_loop(awaiting_urls_file, urls_done_file, output_dir, max_threads, spawn_interval):
+    global active_threads, awaiting_urls, captcha_urls, active_proxies, processing_urls
 
     while True:
         with state_lock:
@@ -269,32 +330,58 @@ def spawn_loop(urls_done_file, output_dir, max_threads, spawn_interval):
                 time.sleep(spawn_interval)
                 continue
 
-        proxy = None
-        with proxy_lock:
-            if active_proxies:
-                proxy = random.choice(active_proxies) 
+        # 1. Prioritize checking captcha_urls list first
+        url = None
+        is_captcha_target = False
 
-        if not proxy:
-            time.sleep(spawn_interval)
-            continue
+        with captcha_list_lock:
+            if captcha_urls:
+                print(f"[*] Awaiting captcha: {len(captcha_urls)}")
+                url = captcha_urls.pop()
+                is_captcha_target = True
 
-        with input_lock:
-            has_urls = bool(awaiting_urls)
-            url = awaiting_urls.pop() if has_urls else None
+        # 2. If no captcha URL, pull from standard awaiting_urls
+        if not url:
+            with processing_urls_lock:
+                with awaiting_urls_lock:
+                    available_urls = awaiting_urls - processing_urls
+                    if available_urls:
+                        url = available_urls.pop()
+                        processing_urls.add(url)
 
-        if not has_urls:
+        # If both lists are empty, check if we're done
+        if not url:
             with state_lock:
                 if active_threads == 0:
                     break
-            # Wait for active urls to finish before checking again
-            time.sleep(spawn_interval) 
+            time.sleep(spawn_interval)
             continue
 
-        with state_lock:
-            active_threads += 1
+        # 3. Spawn loop decides which scraper to launch
+        if is_captcha_target:
+            with state_lock:
+                active_threads += 1
 
-        thread = threading.Thread(target=scrape_url, args=(url, proxy, output_dir, urls_done_file,))
-        thread.start()
+            thread = threading.Thread(target=scrape_url_nodriver_task, args=(url, output_dir, awaiting_urls_file, urls_done_file,))
+            thread.start()
+        else:
+            proxy = None
+            with proxy_lock:
+                if active_proxies:
+                    proxy = random.choice(active_proxies) 
+
+            if not proxy:
+                # Put the URL back since no proxy is available
+                with processing_urls_lock:
+                    processing_urls.remove(url)
+                time.sleep(spawn_interval)
+                continue
+
+            with state_lock:
+                active_threads += 1
+
+            thread = threading.Thread(target=scrape_url, args=(url, proxy, output_dir, awaiting_urls_file, urls_done_file,))
+            thread.start()
 
         time.sleep(spawn_interval)
 
@@ -321,7 +408,7 @@ def get_proxies():
     return proxy_list
 
 def main():
-    global awaiting_urls
+    global awaiting_urls, done_urls
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--urls_path', type=str, required=True, help='List of URLs to scrape')
@@ -330,6 +417,11 @@ def main():
     parser.add_argument('--max_threads', type=int, required=False, default=64, help='Maximum number of threads to use for scraping')
 
     args = parser.parse_args()
+
+    # Check if the urls_path file exists
+    if not os.path.exists(args.urls_path):
+        print(f"[!] The specified urls_path file does not exist: {args.urls_path}")
+        return
 
     # Check if the output directory exists, if not create it
     if not os.path.exists(args.output_dir):
@@ -340,8 +432,8 @@ def main():
         open(args.urls_done, 'w', encoding='utf-8').close()
 
     # Create a list of URLs to scrape, excluding those that have already been scraped or failed
-    done_urls = read_lines(args.urls_done)
-    awaiting_urls = list(set(read_lines(args.urls_path)) - set(done_urls))
+    done_urls = set(read_lines(args.urls_done))
+    awaiting_urls = set(set(read_lines(args.urls_path)) - done_urls)
 
     print(f"Total URLs to scrape: {len(awaiting_urls)}")
 
@@ -352,7 +444,7 @@ def main():
 
 
     # Start the spawn loop to scrape URLs
-    spawn_loop(args.urls_done, args.output_dir, args.max_threads, SPAWN_INTERVAL)
+    spawn_loop(args.urls_path, args.urls_done, args.output_dir, args.max_threads, SPAWN_INTERVAL)
 
 if __name__ == "__main__":
     main()
