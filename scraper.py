@@ -201,7 +201,7 @@ async def scrape_with_nodriver(url):
                 continue
             
             # Once loaded and challenge is cleared, we have success
-            if not is_captcha_protected_content(content) and len(content) > 800:
+            if not is_captcha_protected_content(content):
                 print(f"[+] Cloudflare verification cleared successfully after {second} seconds!")
                 is_solved = True
                 break
@@ -219,9 +219,29 @@ async def scrape_with_nodriver(url):
     finally:
         if browser:
             try:
+                # Explicitly close all WebSocket connections and CDP targets to prevent leaks
+                await asyncio.gather(
+                    *(connection.aclose() for connection in [*getattr(browser, 'targets', []), browser]),
+                    return_exceptions=True,
+                )
+            except Exception:
+                pass
+            
+            process = getattr(browser, '_process', None)
+            try:
                 browser.stop()
             except Exception:
                 pass
+                
+            if process is not None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=3)
+                except Exception:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+
         # Clean up temporary profile directory
         shutil.rmtree(user_data_dir, ignore_errors=True)
 
@@ -309,7 +329,7 @@ def scrape_url(url, proxy_url):
                         process_scraped_content(response.text, url, output_dir, awaiting_urls_file)
                     mark_url_as_done(urls_done_file, url)
                     print(f"[+] Scraped {url} via {proxy_url}")
-            case 403: # Check if 403 is due to Cloudflare challenge before assuming proxy block
+            case 403 | 502: # Check if 403 is due to Cloudflare challenge before assuming proxy block
                 if is_captcha_protected_content(response.text):
                     print(f"[!] Page {url} returned 403 due to Cloudflare/CAPTCHA. Adding to captcha list.")
                     add_url_to_captcha_list(url)
@@ -401,6 +421,12 @@ def nodriver_loop():
             # scrape the URL using nodriver
             html_content = asyncio.run(scrape_with_nodriver(url))
 
+            # Check for not found
+            if "Not Found" in html_content or "not found" in html_content:
+                print(f"[*] URL not found: {url}")
+                mark_url_as_done(urls_done_file, url)
+                continue
+
             # Extract links and save the content, then mark the URL as done
             process_scraped_content(html_content, url, output_dir, awaiting_urls_file)
             mark_url_as_done(urls_done_file, url)
@@ -477,8 +503,6 @@ def main():
     # Start the proxy refresh loop in a separate thread
     proxy_refresh_thread = threading.Thread(target=proxy_refresh_loop, args=(PROXY_REFRESH_INTERVAL,), daemon=True)
     proxy_refresh_thread.start()
-
-
 
     # Start the scraper spawn loop to scrape URLs
     scraper_spawn_thread = threading.Thread(target=scraper_spawn_loop, daemon=True)
