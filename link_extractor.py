@@ -1,9 +1,8 @@
 import argparse
-import threading
 import re
 
+# Extracts the exact hostname from a URL using regex.
 def extract_hostname(url):
-    """Extracts the exact hostname from a URL using regex."""
     match = re.search(r"https?://([^/]+)", url)
     return match.group(1) if match else ""
 

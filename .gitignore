@@ -1,0 +1,7 @@
+.old/
+__pycache__/
+test_pages/
+venv/
+normalized.tsv
+satellites.tsv
+index/

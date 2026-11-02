@@ -2,12 +2,13 @@ import argparse
 import os
 import re
 
+# Page URL = prefix + NORAD ID (the file name)
+URL_PREFIX = "https://keeptrack.space/satellite/"
+
 # Label shown on the page -> TSV column name
 LABEL_TO_COL = {
     # Orbit Data
-    "NORAD ID": "norad_id",
     "International Designator": "intl_designator",
-    "Epoch": "epoch",
     "Elset Source": "elset_source",
     "Apogee": "apogee_km",
     "Perigee": "perigee_km",
@@ -57,183 +58,91 @@ NUMERIC_COLS = {
     "radar_cross_section",
 }
 
-# Name/url/summary come from dedicated elements, not from label/value pairs
-DATA_COLUMNS = ["url", "name", "summary"] + list(LABEL_TO_COL.values())
-TSV_COLUMNS = ["index"] + DATA_COLUMNS
+TSV_COLUMNS = ["norad_id", "url", "name", "summary"] + list(LABEL_TO_COL.values())
 
-# Named HTML entities that may appear on the pages (numeric ones are decoded generically)
-NAMED_ENTITIES = {
-    "amp": "&",
-    "lt": "<",
-    "gt": ">",
-    "quot": '"',
-    "apos": "'",
-    "nbsp": " ",
-    "times": "×",
-    "deg": "°",
-    "ndash": "–",
-    "mdash": "—",
-    "hellip": "…",
-}
-
-# <p class="text-sm text-gray-500" ...>LABEL</p> <p class="font-medium" ...>VALUE</p>
-# Label is [^<]* so the lazy match can never swallow other elements
-PAIR_RE = re.compile(
-    r'<p class="text-sm text-gray-500"[^>]*>([^<]*)</p>\s*'
-    r'<p class="font-medium"[^>]*>(.*?)</p>',
-    re.S,
-)
-TITLE_RE = re.compile(r'<span id="satellite-title"[^>]*>(.*?)</span>', re.S)
-SUMMARY_RE = re.compile(r'<div id="satellite-summary"[^>]*>(.*?)</div>', re.S)
-CANONICAL_RE = re.compile(r'<link rel="canonical" href="([^"]+)"')
-TAG_RE = re.compile(r"<[^>]+>")
-ENTITY_RE = re.compile(r"&(#[xX][0-9a-fA-F]+|#\d+|[a-zA-Z]+);")
-MOJIBAKE_RE = re.compile("[ÂÃâ]")
-WS_RE = re.compile(r"\s+")
-NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
-
-def read_lines(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        # splitlines() removes \n, line.strip() filters out empty or whitespace-only lines
-        lines = [line for line in f.read().splitlines() if line.strip()]
-    return lines
-
-def append_line(file_path, line):
-    with open(file_path, 'a', encoding='utf-8', buffering=1) as f:
-        f.write(line + '\n')
-
-def read_parsed_indexes(output_tsv):
-    # Index is the first column of every row; skip the header line
-    lines = read_lines(output_tsv)
-    return {line.split('\t', 1)[0] for line in lines[1:]}
-
-def find_html_files(input_dir):
-    # Map index (file name without .html) -> full path
-    html_files = {}
-    for filename in os.listdir(input_dir):
-        if filename.endswith('.html'):
-            index = filename[:-len('.html')]
-            html_files[index] = os.path.join(input_dir, filename)
-    return html_files
-
-def decode_entity(match):
-    entity = match.group(1)
-    try:
-        if entity[:2] in ("#x", "#X"):
-            return chr(int(entity[2:], 16))
-        if entity[0] == "#":
-            return chr(int(entity[1:]))
-    except (ValueError, OverflowError):
-        return match.group(0)
-    # Unknown named entities are left untouched
-    return NAMED_ENTITIES.get(entity, match.group(0))
-
-def unescape_entities(text):
-    return ENTITY_RE.sub(decode_entity, text)
-
+# Repairs UTF-8 text that was decoded as latin-1/cp1252 ('Â°' -> '°').
+# Correct text fails the round trip (encode or decode error) and is returned unchanged.
 def fix_mojibake(text):
-    # Repair UTF-8 text that was decoded as latin-1/cp1252 (e.g. 'Â°' -> '°')
-    if not MOJIBAKE_RE.search(text):
-        return text
     for encoding in ("latin-1", "cp1252"):
         try:
             return text.encode(encoding).decode("utf-8")
         except (UnicodeEncodeError, UnicodeDecodeError):
-            continue
+            pass
     return text
 
-def clean_value(raw):
-    text = TAG_RE.sub(" ", raw)       # Drop inner tags (<span class="truncate">...)
-    text = unescape_entities(text)    # &lt; &#39; &amp; ...
+# Removes inner tags, repairs encoding and collapses whitespace
+def clean(text):
+    text = re.sub(r"<[^>]+>", " ", text)
     text = fix_mojibake(text)
-    text = WS_RE.sub(" ", text).strip() # Also removes \n, \t, \r -> safe for TSV
-    return text or None
+    return re.sub(r"\s+", " ", text).strip()
 
+# Cleaned content of the first match of the pattern, "" when not found
+def extract_first(pattern, html_content):
+    match = re.search(pattern, html_content, re.S)
+    return clean(match.group(1)) if match else ""
+
+# '1,410.5 kg' -> '1410.5', value without a number is kept as it is
 def parse_number(value):
-    if value is None:
-        return None
-    match = NUM_RE.search(value)
+    match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", value)
     return match.group(0).replace(",", "") if match else value
 
-def extract_first(pattern, html_content):
-    match = pattern.search(html_content)
-    return clean_value(match.group(1)) if match else None
+def extract_satellite(norad_id, html_content):
+    data = dict.fromkeys(TSV_COLUMNS, "")
+    data["norad_id"] = str(norad_id)
+    data["url"] = URL_PREFIX + str(norad_id)
+    data["name"] = extract_first(r'<span id="satellite-title"[^>]*>(.*?)</span>', html_content)
+    data["summary"] = extract_first(r'<div id="satellite-summary"[^>]*>(.*?)</div>', html_content)
 
-def extract_labeled_fields(html_content):
-    fields = {}
-    for label, value in PAIR_RE.findall(html_content):
-        col = LABEL_TO_COL.get(clean_value(label) or "")
-        # Skip unknown labels and keep only the first occurrence of each label
-        if col is None or col in fields:
+    # Every field is a pair: <p class="text-sm text-gray-500">LABEL</p> <p class="font-medium">VALUE</p>
+    pairs = re.findall(r'<p class="text-sm text-gray-500"[^>]*>([^<]*)</p>\s*<p class="font-medium"[^>]*>(.*?)</p>',
+                       html_content, re.S)
+    for label, value in pairs:
+        col = LABEL_TO_COL.get(label.strip())
+        # Skip labels that are not in LABEL_TO_COL
+        if col is None:
             continue
-        cleaned = clean_value(value)
-        fields[col] = parse_number(cleaned) if col in NUMERIC_COLS else cleaned
-    return fields
-
-def extract_satellite(html_content):
-    # Return a dict of column -> value, or None for non-satellite pages
-    name = extract_first(TITLE_RE, html_content)
-    if name is None:
-        return None
-
-    data = dict.fromkeys(DATA_COLUMNS)
-    data["name"] = name
-    data["url"] = extract_first(CANONICAL_RE, html_content)
-    data["summary"] = extract_first(SUMMARY_RE, html_content)
-    data.update(extract_labeled_fields(html_content))
+        value = clean(value)
+        data[col] = parse_number(value) if col in NUMERIC_COLS else value
     return data
 
-def to_tsv_line(index, data):
-    # None becomes an empty field
-    values = [index] + ["" if data[col] is None else data[col] for col in DATA_COLUMNS]
-    return "\t".join(values)
-
-def process_file(index, file_path, output_tsv):
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-        html_content = f.read()
-
-    data = extract_satellite(html_content)
-    if data is None:
-        print(f"[!] Not a satellite page, skipping: {file_path}")
-        return False
-
-    append_line(output_tsv, to_tsv_line(index, data))
-    print(f"[+] Extracted {index} ({data['name']})")
-    return True
+# NORAD IDs already in the output TSV (first column), so an interrupted run can continue
+def read_parsed_ids(output_tsv):
+    with open(output_tsv, 'r', encoding='utf-8') as f:
+        f.readline()  # header
+        return {int(line.split('\t', 1)[0]) for line in f}
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', type=str, required=True, help='Directory with scraped .html files')
     parser.add_argument('--output_tsv', type=str, required=False, default="./satellites.tsv", help='Output TSV file with extracted data')
-
     args = parser.parse_args()
 
-    # Check if the input directory exists
-    if not os.path.isdir(args.input_dir):
-        print(f"[!] The specified input_dir does not exist: {args.input_dir}")
-        return
-
-    # Check if the output TSV exists and is not empty, if not create it with a header
+    # New output file starts with the header
     if not os.path.exists(args.output_tsv) or os.path.getsize(args.output_tsv) == 0:
         with open(args.output_tsv, 'w', encoding='utf-8') as f:
             f.write("\t".join(TSV_COLUMNS) + '\n')
 
-    # Create a list of files to parse, excluding those that have already been parsed
-    parsed_indexes = read_parsed_indexes(args.output_tsv)
-    html_files = find_html_files(args.input_dir)
-    awaiting_indexes = sorted(set(html_files) - parsed_indexes)
-
-    print(f"Total files to parse: {len(awaiting_indexes)} (already parsed: {len(parsed_indexes)})")
+    # NORAD ID = file name without .html, leading zeros dropped (00043.html -> 43)
+    html_files = {int(name[:-5]): os.path.join(args.input_dir, name)
+                  for name in os.listdir(args.input_dir) if name.endswith('.html') and name[:-5].isdigit()}
+    parsed_ids = read_parsed_ids(args.output_tsv)
+    awaiting_ids = sorted(set(html_files) - parsed_ids)
+    print(f"Total files to parse: {len(awaiting_ids)} (already parsed: {len(parsed_ids)})")
 
     extracted_count = 0
-    for index in awaiting_indexes:
-        try:
-            if process_file(index, html_files[index], args.output_tsv):
-                extracted_count += 1
-        except Exception as e:
-            print(f"[!] Failed to parse {html_files[index]}: {e}")
+    # Line-buffered, so every finished row is on disk if the run is interrupted
+    with open(args.output_tsv, 'a', encoding='utf-8', buffering=1) as out:
+        for norad_id in awaiting_ids:
+            with open(html_files[norad_id], 'r', encoding='utf-8', errors='replace') as f:
+                data = extract_satellite(norad_id, f.read())
+            # Only satellite pages have a title
+            if not data["name"]:
+                print(f"[!] Not a satellite page, skipping: {html_files[norad_id]}")
+                continue
+            out.write("\t".join(data[col] for col in TSV_COLUMNS) + '\n')
+            extracted_count += 1
 
-    print(f"Done. Extracted {extracted_count} of {len(awaiting_indexes)} files.")
+    print(f"Done. Extracted {extracted_count} of {len(awaiting_ids)} files.")
 
 if __name__ == "__main__":
     main()
