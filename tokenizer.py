@@ -2,17 +2,13 @@ import argparse
 import re
 import unicodedata
 
-# shared by the indexer and the search, both must use it or terms will not match
-# changing the rules means the index has to be rebuilt
-
-# small English stopword list, common words that carry no search meaning
+# Common words that carry no search meaning
 STOPWORDS = set("""
 a an and are as at be been but by for from has have in into is it its of on or
 that the their this to was were which with also
 """.split())
 
 
-# 'Société' -> 'societe' like in the lecture example (šťastlivo -> stastny), non-latin letters (e.g. CJK) stay untouched
 def strip_accents(s):
     decomposed = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
@@ -33,7 +29,7 @@ def stem(token):
     return token
 
 
-# text -> list of terms, order and duplicates are kept (tf needs them)
+# text -> list of terms, order and duplicates are kept
 def tokenize(text):
     terms = []
     # letters/digits in any script, underscore excluded
