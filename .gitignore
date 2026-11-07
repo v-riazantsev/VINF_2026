@@ -2,6 +2,6 @@
 __pycache__/
 test_pages/
 venv/
-normalized.tsv
-satellites.tsv
+*.tsv
+*.zip
 index/

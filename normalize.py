@@ -1,8 +1,13 @@
-import argparse
 import re
 from datetime import datetime
 
-from extractor import NUMERIC_COLS
+# columns where only the number is kept (unit is in the column name)
+NUMERIC_COLS = {
+    "apogee_km", "perigee_km", "inclination_deg", "raan_deg", "eccentricity",
+    "arg_perigee_deg", "period_min", "mean_motion_rev_day",
+    "length_m", "diameter_m", "span_m", "dry_mass_kg", "launch_mass_kg",
+    "radar_cross_section",
+}
 
 # columns where 0 really means "unknown" (e.g. debris with no known size/mass)
 ZERO_IS_UNKNOWN = ["length_m", "diameter_m", "span_m", "dry_mass_kg", "launch_mass_kg"]
@@ -15,28 +20,18 @@ GEO_TOLERANCE = 500
 DERIVED_COLUMNS = ["orbit_class", "status", "age_years", "object_type"]
 
 
-# returns (header, rows as dicts)
-def read_tsv(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        # strip only the newline, strip() would eat trailing empty columns
-        header = f.readline().rstrip("\n").split("\t")
-        rows = [dict(zip(header, line.rstrip("\n").split("\t"))) for line in f]
-    return header, rows
-
-
-def write_tsv(file_path, header, rows):
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write("\t".join(header) + "\n")
-        for row in rows:
-            f.write("\t".join(row[c] for c in header) + "\n")
-
-
 # float or None when the value is not a number
 def to_float(s):
     try:
         return float(s)
     except ValueError:
         return None
+
+
+# '1,410.5 kg' -> '1410.5', value without a number is kept as it is
+def parse_number(value):
+    match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", value)
+    return match.group(0).replace(",", "") if match else value
 
 
 # LEO / MEO / GEO / HEO from altitudes in km, '' when unknown
@@ -66,11 +61,13 @@ def object_type(name, summary):
     return "payload"
 
 
-# clean one row and fill all derived columns, age is counted up to today
+# clean one extracted row and fill all derived columns, age is counted up to today
 def normalize_row(r, today):
     if r["intl_designator"].upper() == "UNKNOWN":
         r["intl_designator"] = ""
 
+    for c in NUMERIC_COLS:
+        r[c] = parse_number(r[c])
     for c in ZERO_IS_UNKNOWN:
         if to_float(r[c]) == 0:
             r[c] = ""
@@ -93,30 +90,4 @@ def normalize_row(r, today):
     alive = r["orbit_class"] != ""
     r["status"] = "in_orbit" if alive else "decayed"
     r["age_years"] = f"{(today - launch).days / 365.25:.1f}" if alive and launch else ""
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_tsv", type=str, required=True, help="TSV produced by extractor.py")
-    parser.add_argument("--output_tsv", type=str, default="./data_clean.tsv")
-    args = parser.parse_args()
-
-    header, rows = read_tsv(args.input_tsv)
-    today = datetime.now()
-    for r in rows:
-        normalize_row(r, today)
-
-    write_tsv(args.output_tsv, header + DERIVED_COLUMNS, rows)
-
-    # short report to sanity-check the output
-    print(f"rows written: {len(rows)} -> {args.output_tsv}")
-    for col in ("object_type", "orbit_class", "status"):
-        counts = {}
-        for r in rows:
-            value = r[col] or "(empty)"
-            counts[value] = counts.get(value, 0) + 1
-        print(f"{col}: {counts}")
-
-
-if __name__ == "__main__":
-    main()
+    return r
