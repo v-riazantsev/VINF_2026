@@ -91,3 +91,48 @@ def normalize_row(r, today):
     r["status"] = "in_orbit" if alive else "decayed"
     r["age_years"] = f"{(today - launch).days / 365.25:.1f}" if alive and launch else ""
     return r
+
+
+# ---------- Wikipedia infobox values (wiki_extractor.py) ----------
+
+# unit on the page -> factor to kg or W
+MASS_UNITS = {"kg": 1, "t": 1000, "lb": 0.45359237}
+POWER_UNITS = {"w": 1, "watts": 1, "kw": 1000}
+
+# date text in the infobox -> its format
+DATE_FORMATS = [
+    (r"\d{4} \d{1,2} \d{1,2}", "%Y %m %d"),  # '1990 04 24' from {{Start date|1990|04|24}}
+    (r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),  # '1990-04-24'
+    (r"\d{1,2} [A-Z][a-z]+ \d{4}", "%d %B %Y"),  # '24 April 1990'
+    (r"[A-Z][a-z]+ \d{1,2}, \d{4}", "%B %d, %Y"),  # 'April 24, 1990'
+]
+
+
+# '24 April 1990' -> '24.04.1990' like launch_date from keeptrack, '' when there is no full date
+def wiki_date(value):
+    for pattern, fmt in DATE_FORMATS:
+        m = re.search(pattern, value)
+        if m:
+            try:
+                return datetime.strptime(m.group(), fmt).strftime("%d.%m.%Y")
+            except ValueError:
+                pass
+    return ""
+
+
+# first number with a known unit, converted: '11,110 kg (24,490 lb)' -> '11110', '2400 lb' -> '1088.62', '2.8 kW' -> '2800'
+def wiki_number(value, units):
+    for number, unit in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*([A-Za-z]+)", value):
+        if unit.lower() in units:
+            return f"{float(number.replace(',', '')) * units[unit.lower()]:.2f}".rstrip("0").rstrip(".")
+    return ""
+
+
+# dates to dd.mm.yyyy, masses to kg, power to W
+def normalize_wiki_row(r):
+    r["wiki_launch_date"] = wiki_date(r["wiki_launch_date"])
+    r["wiki_decay_date"] = wiki_date(r["wiki_decay_date"])
+    r["wiki_launch_mass_kg"] = wiki_number(r["wiki_launch_mass_kg"], MASS_UNITS)
+    r["wiki_dry_mass_kg"] = wiki_number(r["wiki_dry_mass_kg"], MASS_UNITS)
+    r["wiki_power_w"] = wiki_number(r["wiki_power_w"], POWER_UNITS)
+    return r

@@ -15,7 +15,7 @@ BM25_B = 0.75
 FILTER_ALIASES = {"date": "launch_date"}
 
 # columns printed next to each result
-SHOW_COLUMNS = ["object_type", "status", "orbit_class", "launch_date"]
+SHOW_COLUMNS = ["object_type", "status", "orbit_class", "launch_date", "wiki_name"]
 
 COMPARE = {">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator.le}
 

@@ -138,7 +138,7 @@ def run_spark(paths, today):
     spark = SparkSession.builder.appName("satellite_extractor").getOrCreate()
     sc = spark.sparkContext
 
-    rows = (sc.parallelize(paths, sc.defaultParallelism)
+    rows = (sc.parallelize(paths)
               .map(lambda path: process_file(path, today))
               .filter(lambda row: row is not None)
               .collect())

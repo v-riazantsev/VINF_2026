@@ -6,14 +6,19 @@ from collections import Counter
 from tsv_io import read_tsv, write_tsv
 from tokenizer import tokenize
 
-# text columns with their own index, so a query can search one field (manufacturer:hughes)
+# text columns with their own index, so a query can search one field (manufacturer:hughes, wiki_operator:nasa)
 TEXT_FIELDS = ["name", "summary", "payload", "bus", "manufacturer", "launch_vehicle", "launch_site",
                "owner", "country", "constellation", "purpose", "mission", "shape", "motor",
                "equipment", "power_system", "adcs", "life_expectancy", "transmitter_frequency",
-               "related_satellites", "major_events"]
+               "related_satellites", "major_events",
+               "wiki_name", "wiki_mission_type", "wiki_operator", "wiki_manufacturer", "wiki_bus",
+               "wiki_launch_rocket", "wiki_launch_site", "wiki_orbit_regime", "wiki_mission_duration", "wiki_text"]
 
 # all text fields together, for keywords without a field
+# without wiki_text: a whole article would make 'all' many times longer for the satellites that have one,
+# and BM25 / tf-idf would rank them by article length; the article is searched with wiki_text:...
 ALL_FIELD = "all"
+ALL_SOURCES = [field for field in TEXT_FIELDS if field != "wiki_text"]
 FIELDS = TEXT_FIELDS + [ALL_FIELD]
 
 # columns copied to docs.tsv, for filters and printing results
@@ -21,7 +26,9 @@ DOC_COLUMNS = ["norad_id", "name", "url", "intl_designator", "object_type", "sta
                "launch_date", "age_years",
                "apogee_km", "perigee_km", "inclination_deg", "eccentricity", "period_min",
                "launch_site", "launch_vehicle", "manufacturer", "owner", "country",
-               "dry_mass_kg", "launch_mass_kg"]
+               "dry_mass_kg", "launch_mass_kg",
+               "wiki_url", "wiki_name", "wiki_launch_date", "wiki_decay_date",
+               "wiki_launch_mass_kg", "wiki_dry_mass_kg", "wiki_power_w"]
 
 POSTINGS_COLUMNS = ["field", "term", "df", "tfidf", "bm25", "postings"]
 LENGTHS_COLUMNS = ["norad_id"] + FIELDS
@@ -44,7 +51,7 @@ def bm25(n_docs, df):
 def index_document(row):
     norad_id = row["norad_id"]
     texts = {field: row[field] for field in TEXT_FIELDS}
-    texts[ALL_FIELD] = " ".join(texts.values())
+    texts[ALL_FIELD] = " ".join(row[field] for field in ALL_SOURCES)
 
     lengths_row = {"norad_id": norad_id}
     tf = {}
@@ -96,23 +103,15 @@ def document_items(doc):
 
 
 def run_spark(rows):
-    # imported here, so the local mode works without Spark
     from pyspark.sql import SparkSession
 
-    spark = SparkSession.builder.appName("satellite_indexer").config("spark.driver.memory", "4g").getOrCreate()
-    sc = spark.sparkContext
-    # workers need tokenizer.py
-    sc.addPyFile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.py"))
-    n_docs = len(rows)
-
-    # a few tasks per core; cached because it is used twice
-    docs = sc.parallelize(rows, sc.defaultParallelism).map(index_document).cache()
+    spark = SparkSession.builder.appName("indexer").getOrCreate()
+    # every document is indexed on some core; cached because it is used twice
+    docs = spark.sparkContext.parallelize(rows).map(index_document).cache()
     lengths_rows = docs.map(lambda doc: doc[1]).collect()
-
-    # same as by_term in run_local, then one row per term
-    items = docs.flatMap(document_items)
-    by_term = items.groupByKey()
-    postings = by_term.map(lambda term: postings_row(term[0], term[1], n_docs)).collect()
+    # same as by_term in run_local: all (norad_id, tf) of one (field, term) together, then one row per term
+    n_docs = len(rows)
+    postings = docs.flatMap(document_items).groupByKey().map(lambda t: postings_row(t[0], t[1], n_docs)).collect()
     spark.stop()
     return lengths_rows, postings
 
@@ -138,7 +137,7 @@ def print_report(n_docs, postings):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_tsv", type=str, required=False, default="./data_clean.tsv", help="TSV produced by extractor.py")
+    parser.add_argument("--input_tsv", type=str, required=False, default="./data_joined.tsv", help="TSV produced by join.py")
     parser.add_argument("--index_dir", type=str, required=False, default="./index", help="Output directory for the index files")
     parser.add_argument("--mode", type=str, required=False, default="local", choices=["local", "spark"], help="local = one process, spark = distributed")
     args = parser.parse_args()
