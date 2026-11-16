@@ -33,23 +33,25 @@ ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "nbsp": " ", "ndash":
 def clean_wiki(text):
     # <!-- comment -->, <ref name="a" />, <ref>...</ref>, <gallery>...</gallery> -> ''
     text = re.sub(r"<!--.*?-->|<ref[^>]*/>|<ref.*?</ref>|<gallery.*?</gallery>", " ", text, flags=re.S)
+    # {{cite web|url=...}}, {{sfn|Orloff|2000}} -> ''
+    text = re.sub(r"\{\{(cite|sfn)[^}]*\}\}", " ", text)
+    # {{convert|2.4|m|ft}} -> '2.4 m'
+    text = re.sub(r"\{\{(convert|cvt)\|([^|}]*)\|([^|}]*)[^}]*\}\}", r" \2 \3 ", text)
     # [[File:x.jpg|thumb|caption]], [[Category:Satellites]] -> ''
     text = re.sub(r"\[\[(File|Image|Category):.*?\]\]", " ", text)
-    # {{sfn|Orloff|2000}}, {{Cite web|url=...}} -> ''
-    text = re.sub(r"\{\{(sfn|efn|cite|citation)[^{}]*\}\}", " ", text, flags=re.I)
-    # {{convert|2.4|m|ft}} -> '2.4 m'
-    text = re.sub(r"\{\{(convert|cvt)\|([^|}]*)\|([^|}]*)[^}]*\}\}", r" \2 \3 ", text, flags=re.I)
-    # {{Start date|1990|04|24}} -> '1990 04 24'   (template name dropped, parameters kept)
-    text = re.sub(r"\{\{[^{}|]*\|?([^{}]*)\}\}", lambda m: " " + m.group(1).replace("|", " ") + " ", text)
-    # table lines '{| class="wikitable"', '|-', '| cell', '! header', '|}' -> ''
-    text = re.sub(r"^\s*(\{\||\||!).*$", " ", text, flags=re.M)
+    # {{Start date|1990|04|24}} -> '|1990|04|24}}'   (template name removed, the rest is cleaned below)
+    text = re.sub(r"\{\{[^|}]*", " ", text)
+    # <br />, </small> -> ''
+    text = re.sub(r"</?\w[^>]*>", " ", text)
     # '''bold''', ''italic'' -> 'bold', 'italic'
     text = re.sub(r"'{2,}", "", text)
-    # <br />, == Heading ==, * bullet, [[ ]] of links, leftover {{ }} and | -> ' '
-    # [[Hubble Space Telescope|Hubble]] -> 'Hubble Space Telescope Hubble'
-    text = re.sub(r"</?\w[^<>]*>|={2,}|^[*#:;]+|\{\{|\}\}|\[\[|\]\]|\|", " ", text, flags=re.M)
+    # == Heading == -> 'Heading'
+    text = re.sub(r"={2,}", " ", text)
+    # every leftover bracket and pipe: [[NASA|nasa]] -> 'NASA nasa', '|1990|04|24}}' -> '1990 04 24'
+    text = re.sub(r"[\[\]{}|]", " ", text)
     # &nbsp; -> ' ', &mdash; -> '—'
-    text = re.sub(r"&(\w+);", lambda m: ENTITIES.get(m.group(1), " "), text)
+    for name, char in ENTITIES.items():
+        text = text.replace(f"&{name};", char)
     # 'a \n  b' -> 'a b'
     return re.sub(r"\s+", " ", text).strip()
 
@@ -63,8 +65,8 @@ def process_page(page):
     page = page.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     title, text = re.search(r"<title>(.*?)</title>.*<text.*?>(.*)</text>", page, re.S).groups()
 
-    # the infobox ends with a '}}' line that is not followed by another field ('|') or another '}}'
-    infobox = re.search(r"\{\{Infobox(.*?)\n\}\}(?!\s*[|}])", text, re.S | re.I)
+    # the infobox ends with a '}}' line that is not followed by another field ('|')
+    infobox = re.search(r"\{\{Infobox(.*?)\n\}\}(?!\s*\|)", text, re.S | re.I)
     if not infobox:
         return None
     # every field starts on a new line: '| SATCAT = 20580'
@@ -84,7 +86,7 @@ def process_page(page):
         return None  # can not be joined with keeptrack
 
     # article text without the infobox
-    row["wiki_text"] = clean_wiki(text[:infobox.start()] + text[infobox.end():])
+    row["wiki_text"] = clean_wiki(text[infobox.end():])
     return normalize_wiki_row(row)
 
 
@@ -104,8 +106,11 @@ def run_local(dump_path):
 def run_spark(dump_path):
     from pyspark.sql import SparkSession
 
-    spark = SparkSession.builder.appName("wiki_extractor").getOrCreate()
+    # Spark's default 1g is too small for the whole dump
+    spark = SparkSession.builder.appName("wiki_extractor").config("spark.driver.memory", "4g").getOrCreate()
     pages = spark.read.text(dump_path, lineSep="</page>")
+    # Only pages with 'SATCAT' are sent to Python
+    pages = pages.filter("value LIKE '%SATCAT%'")
     rows = pages.rdd.map(lambda row: process_page(row.value)).filter(lambda row: row).collect()
     spark.stop()
     return rows

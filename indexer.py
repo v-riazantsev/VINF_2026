@@ -15,10 +15,7 @@ TEXT_FIELDS = ["name", "summary", "payload", "bus", "manufacturer", "launch_vehi
                "wiki_launch_rocket", "wiki_launch_site", "wiki_orbit_regime", "wiki_mission_duration", "wiki_text"]
 
 # all text fields together, for keywords without a field
-# without wiki_text: a whole article would make 'all' many times longer for the satellites that have one,
-# and BM25 / tf-idf would rank them by article length; the article is searched with wiki_text:...
 ALL_FIELD = "all"
-ALL_SOURCES = [field for field in TEXT_FIELDS if field != "wiki_text"]
 FIELDS = TEXT_FIELDS + [ALL_FIELD]
 
 # columns copied to docs.tsv, for filters and printing results
@@ -51,7 +48,7 @@ def bm25(n_docs, df):
 def index_document(row):
     norad_id = row["norad_id"]
     texts = {field: row[field] for field in TEXT_FIELDS}
-    texts[ALL_FIELD] = " ".join(row[field] for field in ALL_SOURCES)
+    texts[ALL_FIELD] = " ".join(texts.values())
 
     lengths_row = {"norad_id": norad_id}
     tf = {}

@@ -93,7 +93,7 @@ def normalize_row(r, today):
     return r
 
 
-# ---------- Wikipedia infobox values (wiki_extractor.py) ----------
+# Wikipedia
 
 # unit on the page -> factor to kg or W
 MASS_UNITS = {"kg": 1, "t": 1000, "lb": 0.45359237}
