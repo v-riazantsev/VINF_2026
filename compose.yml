@@ -1,0 +1,7 @@
+services:
+    lucene:
+        image: coady/pylucene:10.0.0
+        user: "1000:1000"
+        volumes:
+            - ${PWD}:${PWD}
+        working_dir: ${PWD}
