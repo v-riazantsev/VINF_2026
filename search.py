@@ -22,14 +22,14 @@ COMPARE = {">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator
 
 # 'orbit_class=GEO launch_vehicle:"falcon 9" broadband'
 #   -> filters [("orbit_class", "=", "GEO")], keywords [("launch_vehicle", "falcon"), ("launch_vehicle", "9"), ("all", "broadband")]
-def parse_query(query, doc_columns):
+# raw=True (Lucene): keywords are kept as written, [("launch_vehicle", '"falcon 9"'), ("all", "broadband")],
+# so Lucene's query parser can read phrases ("..."), fuzzy (hubel~) and wildcards (star*)
+def parse_query(query, doc_columns, raw=False):
     filters, keywords = [], []
     # split on spaces, quoted parts stay together
     for part in re.findall(r'(?:[^\s"]|"[^"]*")+', query):
-        part = part.replace('"', '')
-
-        # filter: field, operator, value (inclination_deg>90)
-        m = re.match(r"^([a-z_]+)(>=|<=|!=|=|>|<)(.+)$", part)
+        # filter: field, operator, value (inclination_deg>90), quotes only group the value
+        m = re.match(r"^([a-z_]+)(>=|<=|!=|=|>|<)(.+)$", part.replace('"', ''))
         if m:
             field, op, value = m.groups()
             field = FILTER_ALIASES.get(field, field)
@@ -46,7 +46,10 @@ def parse_query(query, doc_columns):
                 raise ValueError(f"unknown text field '{field}', use one of: {', '.join(TEXT_FIELDS)}")
         else:
             field, text = ALL_FIELD, part
-        for term in tokenize(text):
+        if raw:
+            keywords.append((field, text))
+            continue
+        for term in tokenize(text.replace('"', '')):
             if (field, term) not in keywords:
                 keywords.append((field, term))
     return filters, keywords
@@ -133,9 +136,16 @@ def rank(candidates, keywords, postings, lengths, avg, method, match):
     return sorted(scores.items(), key=lambda kv: (-kv[1], int(kv[0])))
 
 
-def print_results(results, docs, filters, method, top):
+def print_query(filters, keywords):
+    print(f"filters:  {' '.join(f + op + v for f, op, v in filters) or '-'}")
+    print(f"keywords: {' '.join(t if f == ALL_FIELD else f'{f}:{t}' for f, t in keywords) or '-'}")
+
+
+# total: number of all results when results holds only the top ones
+def print_results(results, docs, filters, method, top, total=None):
+    total = len(results) if total is None else total
     columns = SHOW_COLUMNS + [f for f, _, _ in filters if f not in SHOW_COLUMNS]
-    print(f"\n[{method}] {len(results)} results" + (f", showing top {top}" if len(results) > top else ""))
+    print(f"\n[{method}] {total} results" + (f", showing top {top}" if total > top else ""))
     for i, (doc, score) in enumerate(results[:top], 1):
         d = docs[doc]
         score_str = f"{score:8.4f}" if score is not None else "       -"
@@ -160,8 +170,7 @@ def main():
         print(f"[!] {e}")
         return
 
-    print(f"filters:  {' '.join(f + op + v for f, op, v in filters) or '-'}")
-    print(f"keywords: {' '.join(t if f == ALL_FIELD else f'{f}:{t}' for f, t in keywords) or '-'}")
+    print_query(filters, keywords)
 
     _, length_rows = read_tsv(f"{args.index_dir}/doc_lengths.tsv")
     lengths = {r["norad_id"]: {field: int(r[field]) for field in FIELDS} for r in length_rows}

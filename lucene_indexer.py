@@ -5,25 +5,22 @@ import os
 import lucene
 from java.nio.file import Paths
 from org.apache.lucene.analysis.en import EnglishAnalyzer
-from org.apache.lucene.document import Document, DoublePoint, Field, IntPoint, StoredField, StringField, TextField
+from org.apache.lucene.document import Document, DoublePoint, Field, IntPoint, StoredField, TextField
 from org.apache.lucene.index import IndexWriter, IndexWriterConfig
 from org.apache.lucene.store import FSDirectory
 
 from indexer import ALL_FIELD, TEXT_FIELDS
 from tsv_io import read_tsv
 
-# one exact value, not split into words: TermQuery, filters (orbit_class=GEO)
+# short values (GEO, payload, in_orbit)
 EXACT_FIELDS = ["norad_id", "intl_designator", "object_type", "status", "orbit_class"]
 
-# full text (TEXT_FIELDS from indexer.py): split into words by the analyzer, searched by words and phrases
-# wiki_text is searchable but not stored, the whole article is never printed
-
-# numbers: DoublePoint for range queries (inclination_deg>90) + StoredField to print the value
+# numbers: DoublePoint for range queries (inclination_deg:[90 TO *]) + StoredField to print the value
 NUMBER_FIELDS = ["apogee_km", "perigee_km", "inclination_deg", "eccentricity", "period_min",
                  "dry_mass_kg", "launch_mass_kg", "age_years",
                  "wiki_launch_mass_kg", "wiki_dry_mass_kg", "wiki_power_w"]
 
-# dates 'dd.mm.yyyy': IntPoint with yyyymmdd for range queries (24.04.1990 -> 19900424) + StoredField to print it
+# dates 'dd.mm.yyyy': IntPoint with yyyymmdd for range queries (24.04.1990 -> 19900424)
 DATE_FIELDS = ["launch_date", "wiki_launch_date", "wiki_decay_date"]
 
 # only printed, never searched
@@ -39,15 +36,11 @@ def date_number(value):
 # one row of data_joined.tsv -> Lucene document, empty values are left out
 def make_document(row):
     doc = Document()
-    for field in EXACT_FIELDS:
-        if row[field]:
-            doc.add(StringField(field, row[field].lower(), Field.Store.NO))
-            doc.add(StoredField(field, row[field]))
-    for field in TEXT_FIELDS:
+    for field in EXACT_FIELDS + TEXT_FIELDS:
         if row[field]:
             store = Field.Store.NO if field == "wiki_text" else Field.Store.YES
             doc.add(TextField(field, row[field], store))
-    # all text fields together, for words without a field
+    # all text fields together
     doc.add(TextField(ALL_FIELD, " ".join(row[field] for field in TEXT_FIELDS), Field.Store.NO))
     for field in NUMBER_FIELDS:
         if row[field]:
@@ -84,8 +77,6 @@ def main():
 
     for row in rows:
         writer.addDocument(make_document(row))
-        
-    writer.commit()
     writer.close()
 
     print(f"documents: {len(rows)}, "
